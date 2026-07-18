@@ -47,7 +47,7 @@ and get the right page back by semantic similarity.
 - **Open the popup** to see the top pages **semantically similar to the tab you
   currently have open**, each with a similarity score and a text snippet.
 - **Type a query** to run a semantic search across everything you've indexed.
-  Results below a 0.7 cosine-similarity threshold are hidden.
+  Results use a looser cutoff so broad/loosely-related queries still return matches.
 - **"Index current tab"** forces the active tab to be embedded immediately
   (useful for testing).
 - **Options** (Settings link in the popup): enable/disable capture, set the
@@ -69,16 +69,12 @@ SemanticEmbedder.embed(text, { taskType: "retrieval-document" })  → 768-dims (
    │
    ▼
 IndexedDB  { id = hash(url), url, title, text, embedding[768], norm,
-             firstVisitedAt, lastVisitedAt, visitCount, device, dim }
-   │
-   ▼
-Worker (in-memory state) ← INITIALIZE_STATE on startup, ADD_PAGE on each index
+              firstVisitedAt, lastVisitedAt, visitCount, device, dim }
    │
    ▼
 Popup: embed query/tab (taskType: "retrieval-query") → Float32Array
-   → transferred zero-copy into the Worker
-   → 2-stage Matryoshka (MRL) ranking over the in-memory index
-   → top-k (≥ 0.7 cosine) returned as lightweight metadata
+   → 2-stage Matryoshka (MRL) ranking over IndexedDB pages (in the SW)
+   → top-k returned as lightweight metadata (looser cutoff for search)
 ```
 
 Key points:
@@ -93,11 +89,11 @@ Key points:
   window context, so it runs in an **Offscreen Document** when
   `chrome.offscreen` exists, and falls back to running directly in the service
   worker on builds that lack the Offscreen API.
-- **Fast, off-thread search (Web Worker).** All ranking runs in a dedicated
-  Web Worker that holds the page corpus **in memory** (`INITIALIZE_STATE` on
-  startup, `ADD_PAGE` on each new index). The main thread never re-reads
-  IndexedDB or serializes the whole corpus on a search — it only sends the
-  query vector (transferred zero-copy via its `ArrayBuffer`).
+- **Fast in-SW ranking (no Web Worker).** Chrome MV3 service workers do
+  **not** support `new Worker()`, so the ranking logic runs directly in the
+  background SW. All per-search compute stays cheap: it reads the corpus
+  from IndexedDB once per search and applies the optimizations below — no
+  full-corpus `postMessage` serialization, no separate thread needed.
 - **Two-stage Matryoshka (MRL) retrieval.** Stage 1 ranks by the first 128
   dimensions (a zero-allocation `subarray` view, norm computed on-the-fly) to
   cheaply narrow N pages down to a candidate pool. Stage 2 re-ranks only
@@ -107,8 +103,10 @@ Key points:
 - **Zero-allocation storage.** Only the full 768-dim `Float32Array` and its
   `norm` are persisted to IndexedDB. The 128-dim MRL sub-vector is derived
   on-the-fly as a view over the same buffer — nothing redundant is stored.
-- **Threshold.** Similarity results are filtered at **0.7** cosine — tune in
-  `src/search-worker.js` (`rankPages` default threshold) if you want broader recall.
+- **Two thresholds.** `SIMILAR_THRESHOLD` (0.3, stricter) is used
+  when the popup opens on the active tab, so only pages genuinely
+  similar are shown. `SEARCH_THRESHOLD` (0.0, looser) is used for
+  free-text queries. Tune both in `src/config.js`.
 - **Model dimension is 768** for the on-device EmbeddingGemma build used here.
   `dim` is stored per record.
 
@@ -122,12 +120,10 @@ chrome-smart-history/
 ├── LICENSE
 ├── NOTICE
 ├── src/
-│   ├── config.js            # shared constants (incl. MRL_SUB_DIM)
+│   ├── config.js            # shared constants
 │   ├── db.js               # IndexedDB (pages + search_cache stores)
 │   ├── embedding.js        # getEmbedder / embedDocument / embedQuery
 │   ├── background.js       # capture + search orchestration (service worker)
-│   ├── search-worker.js   # in-memory MRL state manager (ranking off-thread)
-│   ├── search-client.js   # worker client (zero-copy query transfer)
 │   ├── offscreen-manager.js# ensures the offscreen document exists
 │   ├── content/extract.js  # fallback page-text extraction
 │   ├── offscreen/          # offscreen.html + offscreen.js (hosts Embedding API)

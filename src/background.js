@@ -1,12 +1,19 @@
-// Background service worker: orchestrate capture, embedding, storage, search.
+﻿// Background service worker: orchestrate capture, embedding, storage, search.
 // MVP: local-only (no Cloudflare). Embeddings computed in-process (SW) or in
 // the Offscreen Document when the Offscreen API is available.
+//
+// NOTE: Chrome MV3 service workers do NOT support `new Worker()`, so the
+// ranking logic lives here directly. All the perf optimizations are kept:
+// Float32Array storage, precomputed norms, two-stage Matryoshka (MRL)
+// retrieval with a hard-capped candidate pool, and a top-k heap.
 
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
   DEVICE_ID_KEY,
   RETENTION_DAYS_DEFAULT,
+  SIMILAR_THRESHOLD,
+  SEARCH_THRESHOLD,
 } from "./config.js";
 import { ensureOffscreen } from "./offscreen-manager.js";
 import {
@@ -21,16 +28,9 @@ import {
   getCachedSearch,
 } from "./db.js";
 import { embedDocument, embedQuery } from "./embedding.js";
-import {
-  initWorkerState,
-  addPageToWorker,
-  rankPagesAsync,
-  recentPagesAsync,
-} from "./search-client.js";
 
-// L2 norm of a vector, computed when a page is indexed so search (in the
-// worker) only needs a dot product + one division. Kept local because the
-// worker maintains its own copy of this helper.
+// L2 norm of a vector, computed when a page is indexed so search only
+// needs a dot product + one division.
 function vectorNorm(v) {
   let s = 0;
   for (let i = 0; i < v.length; i++) s += v[i] * v[i];
@@ -153,7 +153,7 @@ export function indexTab(tabId, url, title) {
       const id = await urlKey(url);
       const existing = await getPageByUrl(url);
       const now = Date.now();
-      const page = {
+      await putPage({
         id,
         url,
         title: title || url,
@@ -166,10 +166,7 @@ export function indexTab(tabId, url, title) {
         visitCount: (existing?.visitCount || 0) + 1,
         device: await getDeviceId(),
         dim: values.length,
-      };
-      await putPage(page);
-      // Keep the in-memory worker index in sync (no IndexedDB re-read).
-      syncPageToWorker(page);
+      });
       console.log(`[smart-history] indexed ${url}`);
       return { ok: true };
     } catch (e) {
@@ -198,11 +195,141 @@ async function handleExtract(msg) {
 
 // ---- search (served to popup) ----
 
-// Push a single page into the in-memory worker index (no IndexedDB re-read).
-function syncPageToWorker(page) {
-  addPageToWorker(page).catch((e) =>
-    console.warn("[smart-history] worker sync failed:", e)
+// Cosine similarity using a precomputed norm for `b`. `queryNorm` is computed
+// once per query; `bNorm` may be undefined to force a cheap recompute (used
+// for the 128-dim view during the coarse pass).
+function cosineSimilarity(a, b, queryNorm, bNorm) {
+  if (!a || !b || a.length !== b.length) return 0;
+  const qn = queryNorm != null ? queryNorm : vectorNorm(a);
+  const bn = bNorm != null ? bNorm : vectorNorm(b);
+  if (qn === 0 || bn === 0) return 0;
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot / (qn * bn);
+}
+
+// Fixed-size min-heap keyed by `score` (descending). Keeps only the top-k
+// cheapest elements instead of sorting the whole array.
+class TopKHeap {
+  constructor(k) {
+    this.k = k;
+    this.items = [];
+  }
+  push(item) {
+    const h = this.items;
+    if (h.length < this.k) {
+      h.push(item);
+      this._bubbleUp(h.length - 1);
+      return;
+    }
+    if (item.score <= h[0].score) return;
+    h[0] = item;
+    this._bubbleDown(0);
+  }
+  _bubbleUp(i) {
+    const h = this.items;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (h[p].score <= h[i].score) break;
+      [h[p], h[i]] = [h[i], h[p]];
+      i = p;
+    }
+  }
+  _bubbleDown(i) {
+    const h = this.items;
+    const n = h.length;
+    for (;;) {
+      let s = i;
+      const l = 2 * i + 1;
+      const r = 2 * i + 2;
+      if (l < n && h[l].score < h[s].score) s = l;
+      if (r < n && h[r].score < h[s].score) s = r;
+      if (s === i) break;
+      [h[s], h[i]] = [h[i], h[s]];
+      i = s;
+    }
+  }
+  sorted() {
+    return this.items.slice().sort((a, b) => b.score - a.score);
+  }
+}
+
+const MRL_SUB_DIM = 128; // coarse-pass resolution (prefix of the 768-dim vec)
+const COARSE_MIN_MUL = 3; // at least 3x topK
+const COARSE_FRACTION = 0.1; // ...or 10% of the corpus
+const MAX_CANDIDATES = 1000; // hard cap so Stage 2 never blows up
+
+// Two-stage Matryoshka (MRL) retrieval over the in-memory page list:
+//   Stage 1 (coarse): rank by the first MRL_SUB_DIM components (a zero-alloc
+//     subarray view) and keep the top `candidateK` pages.
+//   Stage 2 (fine): re-rank only those candidates with the full 768-dim vector
+//     and return the top `topK`. `candidateK` is hard-capped so Stage-2
+//     cost stays bounded no matter how large N grows.
+// Default threshold is 0.0 so the top-k most-similar pages are always
+// returned. EmbeddingGemma retrieval-style cosine scores for unrelated
+// text sit well below 0.7; a fixed 0.7 cutoff hides nearly
+// every result. Tune per your corpus if you want stricter filtering.
+function rankPages(queryVec, pages, topK = 10, threshold = 0.0) {
+  const candidateK = Math.min(
+    MAX_CANDIDATES,
+    Math.max(topK * COARSE_MIN_MUL, Math.ceil(pages.length * COARSE_FRACTION))
   );
+  const qNorm = vectorNorm(queryVec);
+  const queryVec128 = queryVec.subarray(0, MRL_SUB_DIM);
+  const qNorm128 = vectorNorm(queryVec128);
+
+  const coarse = new TopKHeap(candidateK);
+  for (const p of pages) {
+    const emb = p.embedding;
+    if (!emb) continue;
+    const sub = emb.subarray(0, MRL_SUB_DIM); // zero-alloc view
+    const score = cosineSimilarity(queryVec128, sub, qNorm128, undefined);
+    coarse.push({ score, page: p });
+  }
+
+  const fine = new TopKHeap(topK);
+  for (const { page: p } of coarse.sorted()) {
+    const emb = p.embedding;
+    if (!emb) continue;
+    const score = cosineSimilarity(
+      queryVec,
+      emb,
+      qNorm,
+      p.norm != null ? p.norm : undefined
+    );
+    if (score >= threshold) fine.push({ score, page: p });
+  }
+
+  return fine.sorted().map(({ score, page: p }) => ({
+    id: p.id,
+    url: p.url,
+    title: p.title,
+    site: p.site,
+    visitedAt: p.lastVisitedAt || p.firstVisitedAt,
+    score,
+    snippet: (p.text || "").slice(0, 420),
+  }));
+}
+
+// Recently visited pages (used as a fallback when no similar pages are found).
+function recentPages(pages, topK = 10) {
+  return pages
+    .slice()
+    .sort(
+      (a, b) =>
+        (b.lastVisitedAt || b.firstVisitedAt || 0) -
+        (a.lastVisitedAt || a.firstVisitedAt || 0)
+    )
+    .slice(0, topK)
+    .map((p) => ({
+      id: p.id,
+      url: p.url,
+      title: p.title,
+      site: p.site,
+      visitedAt: p.lastVisitedAt || p.firstVisitedAt,
+      score: 0,
+      snippet: (p.text || "").slice(0, 420),
+    }));
 }
 
 async function handleSearch(query, topK) {
@@ -228,9 +355,8 @@ async function handleSearch(query, topK) {
   }
   const queryVec = Float32Array.from(values);
 
-  // Search runs in the worker over its in-memory index — no IndexedDB read,
-  // no full-corpus postMessage serialization on the main thread.
-  const { results } = await rankPagesAsync(queryVec, topK, 0.7);
+  const pages = await getAllPages();
+  const results = rankPages(queryVec, pages, topK, SEARCH_THRESHOLD);
 
   await cacheSearch(cacheKey, results);
   return results;
@@ -268,14 +394,14 @@ async function handleSimilarCurrent(topK = 10) {
   }
   const queryVec = Float32Array.from(values);
 
-  const { results } = await rankPagesAsync(queryVec, topK, 0.7);
-  return results;
+  const pages = await getAllPages();
+  return rankPages(queryVec, pages, topK, SIMILAR_THRESHOLD);
 }
 
 // Recently visited pages (used as a fallback when no similar pages are found).
 async function handleRecent(topK = 10) {
-  const { results } = await recentPagesAsync(topK);
-  return results;
+  const pages = await getAllPages();
+  return recentPages(pages, topK);
 }
 
 // ---- message router ----
@@ -304,11 +430,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           });
         } else if (msg.type === "DELETE") {
           await deletePage(msg.id);
-          await initSearchIndex();
           sendResponse({ ok: true });
         } else if (msg.type === "CLEAR_ALL") {
           await clearAllPages();
-          await initSearchIndex();
           sendResponse({ ok: true });
         } else if (msg.type === "INDEX_CURRENT") {
           const [tab] = await chrome.tabs.query({
@@ -330,18 +454,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // ---- periodic cleanup ----
 
-// Load the full corpus from IndexedDB into the in-memory worker index.
-// Called once on startup and whenever the local store is mutated wholesale.
-async function initSearchIndex() {
-  try {
-    const pages = await getAllPages();
-    await initWorkerState(pages);
-    console.log(`[smart-history] worker index loaded: ${pages.length} pages`);
-  } catch (e) {
-    console.warn("[smart-history] worker index init failed:", e);
-  }
-}
-
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "cleanup") {
     const settings = await getSettings();
@@ -351,14 +463,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 chrome.alarms.create("cleanup", { periodInMinutes: 60 * 24 });
 
-// Warm up the offscreen document on startup so first capture is fast, and load
-// the search index into the worker so the first search needs no IndexedDB read.
+// Warm up the offscreen document on startup so first capture is fast.
 chrome.runtime.onInstalled.addListener(() => {
   ensureOffscreen().catch(() => {});
-  initSearchIndex();
 });
 
 chrome.runtime.onStartup?.addListener(() => {
   ensureOffscreen().catch(() => {});
-  initSearchIndex();
 });
+

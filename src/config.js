@@ -4,11 +4,14 @@ export const DB_NAME = "smart-history";
 export const RETENTION_DAYS_DEFAULT = 90;
 export const MAX_TEXT_CHARS = 3000;
 export const EMBED_DIM = 768;
-// MRL coarse-pass resolution. The 128-dim sub-vector is NOT stored — it is a
-// zero-allocation `subarray(0, MRL_SUB_DIM)` view over the 768-dim vector.
-export const MRL_SUB_DIM = 128;
 export const DEFAULT_TOP_K = 10;
-export const SIMILARITY_THRESHOLD = 0.0;
+// Different cutoffs for the two entry points:
+//  - SIMILAR_CURRENT (popup opens on the active tab): stricter, so only
+//    pages genuinely similar to the current tab are shown.
+//  - SEARCH (free-text query): looser, so results are not hidden when the
+//    query is broad or loosely related.
+export const SIMILAR_THRESHOLD = 0.3;
+export const SEARCH_THRESHOLD = 0.0;
 
 export const SETTINGS_KEY = "settings";
 export const DEVICE_ID_KEY = "deviceId";
