@@ -20,7 +20,22 @@ import {
   cacheSearch,
   getCachedSearch,
 } from "./db.js";
-import { rankPages, cosineSimilarity, EMBED_DIM, embedDocument, embedQuery } from "./embedding.js";
+import { embedDocument, embedQuery } from "./embedding.js";
+import {
+  initWorkerState,
+  addPageToWorker,
+  rankPagesAsync,
+  recentPagesAsync,
+} from "./search-client.js";
+
+// L2 norm of a vector, computed when a page is indexed so search (in the
+// worker) only needs a dot product + one division. Kept local because the
+// worker maintains its own copy of this helper.
+function vectorNorm(v) {
+  let s = 0;
+  for (let i = 0; i < v.length; i++) s += v[i] * v[i];
+  return Math.sqrt(s);
+}
 
 // Stable key per URL so re-visits overwrite the same record (dedupe).
 async function urlKey(url) {
@@ -113,7 +128,7 @@ export function indexTab(tabId, url, title) {
       console.log("[smart-history] extracted length:", text ? text.length : 0);
       if (!text) return { ok: false, reason: "empty-text" };
 
-      let values;
+      let rawValues;
       if (await offscreenAvailable()) {
         const { ok, values: v, error } = await chrome.runtime.sendMessage({
           target: "offscreen-embed",
@@ -121,10 +136,16 @@ export function indexTab(tabId, url, title) {
           text: `${title}\n${text}`,
         });
         if (!ok) return { ok: false, reason: "embed-failed", error };
-        values = v;
+        rawValues = v;
       } else {
-        values = Array.from(await embedDocument(`${title}\n${text}`));
+        rawValues = await embedDocument(`${title}\n${text}`);
       }
+      // Store as a TypedArray (V8 can vectorize the math) and precompute the
+      // L2 norm once so search only needs a dot product + one division.
+      // Only the full 768-dim vector is persisted; the 128-dim MRL sub-vector
+      // is derived on-the-fly as a zero-alloc view during search.
+      const values = Float32Array.from(rawValues);
+      const norm = vectorNorm(values);
       console.log("[smart-history] embedded dims:", values?.length);
 
       // Dedupe by URL: same URL re-visited updates the existing record
@@ -132,19 +153,23 @@ export function indexTab(tabId, url, title) {
       const id = await urlKey(url);
       const existing = await getPageByUrl(url);
       const now = Date.now();
-      await putPage({
+      const page = {
         id,
         url,
         title: title || url,
         site: new URL(url).hostname,
         text,
         embedding: values,
+        norm,
         firstVisitedAt: existing?.firstVisitedAt || now,
         lastVisitedAt: now,
         visitCount: (existing?.visitCount || 0) + 1,
         device: await getDeviceId(),
         dim: values.length,
-      });
+      };
+      await putPage(page);
+      // Keep the in-memory worker index in sync (no IndexedDB re-read).
+      syncPageToWorker(page);
       console.log(`[smart-history] indexed ${url}`);
       return { ok: true };
     } catch (e) {
@@ -173,6 +198,13 @@ async function handleExtract(msg) {
 
 // ---- search (served to popup) ----
 
+// Push a single page into the in-memory worker index (no IndexedDB re-read).
+function syncPageToWorker(page) {
+  addPageToWorker(page).catch((e) =>
+    console.warn("[smart-history] worker sync failed:", e)
+  );
+}
+
 async function handleSearch(query, topK) {
   if (!query || !query.trim()) return [];
 
@@ -192,18 +224,13 @@ async function handleSearch(query, topK) {
     if (!ok) throw new Error(error || "Embedding query failed");
     values = v;
   } else {
-    values = Array.from(await embedQuery(query));
+    values = await embedQuery(query);
   }
+  const queryVec = Float32Array.from(values);
 
-  const pages = await getAllPages();
-  const scored = pages
-    .map((p) => ({ ...p, score: cosineSimilarity(Float32Array.from(values), p.embedding) }))
-    .sort((a, b) => b.score - a.score);
-  console.log(
-    "[smart-history] top scores:",
-    scored.slice(0, 3).map((s) => s.score.toFixed(3))
-  );
-  const results = rankPages(Float32Array.from(values), pages, topK);
+  // Search runs in the worker over its in-memory index — no IndexedDB read,
+  // no full-corpus postMessage serialization on the main thread.
+  const { results } = await rankPagesAsync(queryVec, topK, 0.7);
 
   await cacheSearch(cacheKey, results);
   return results;
@@ -237,18 +264,18 @@ async function handleSimilarCurrent(topK = 10) {
     if (!ok) throw new Error(error || "Embedding query failed");
     values = v;
   } else {
-    values = Array.from(await embedQuery(`${tab.title}\n${text}`));
+    values = await embedQuery(`${tab.title}\n${text}`);
   }
+  const queryVec = Float32Array.from(values);
 
-  const pages = await getAllPages();
-  const scored = pages
-    .map((p) => ({ ...p, score: cosineSimilarity(Float32Array.from(values), p.embedding) }))
-    .sort((a, b) => b.score - a.score);
-  console.log(
-    "[smart-history] similar top scores:",
-    scored.slice(0, 3).map((s) => s.score.toFixed(3))
-  );
-  return rankPages(Float32Array.from(values), pages, topK);
+  const { results } = await rankPagesAsync(queryVec, topK, 0.7);
+  return results;
+}
+
+// Recently visited pages (used as a fallback when no similar pages are found).
+async function handleRecent(topK = 10) {
+  const { results } = await recentPagesAsync(topK);
+  return results;
 }
 
 // ---- message router ----
@@ -277,9 +304,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           });
         } else if (msg.type === "DELETE") {
           await deletePage(msg.id);
+          await initSearchIndex();
           sendResponse({ ok: true });
         } else if (msg.type === "CLEAR_ALL") {
           await clearAllPages();
+          await initSearchIndex();
           sendResponse({ ok: true });
         } else if (msg.type === "INDEX_CURRENT") {
           const [tab] = await chrome.tabs.query({
@@ -301,6 +330,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // ---- periodic cleanup ----
 
+// Load the full corpus from IndexedDB into the in-memory worker index.
+// Called once on startup and whenever the local store is mutated wholesale.
+async function initSearchIndex() {
+  try {
+    const pages = await getAllPages();
+    await initWorkerState(pages);
+    console.log(`[smart-history] worker index loaded: ${pages.length} pages`);
+  } catch (e) {
+    console.warn("[smart-history] worker index init failed:", e);
+  }
+}
+
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "cleanup") {
     const settings = await getSettings();
@@ -310,11 +351,14 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 chrome.alarms.create("cleanup", { periodInMinutes: 60 * 24 });
 
-// Warm up the offscreen document on startup so first capture is fast.
+// Warm up the offscreen document on startup so first capture is fast, and load
+// the search index into the worker so the first search needs no IndexedDB read.
 chrome.runtime.onInstalled.addListener(() => {
   ensureOffscreen().catch(() => {});
+  initSearchIndex();
 });
 
 chrome.runtime.onStartup?.addListener(() => {
   ensureOffscreen().catch(() => {});
+  initSearchIndex();
 });

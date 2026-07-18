@@ -41,39 +41,4 @@ export async function embedQuery(text) {
   return result.embeddings[0].values; // Float32Array(768)
 }
 
-export function cosineSimilarity(a, b) {
-  if (!a || !b || a.length !== b.length) return 0;
-  let dot = 0,
-    na = 0,
-    nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  if (na === 0 || nb === 0) return 0;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
-
-// Local semantic search over a set of stored pages.
-export function rankPages(queryVec, pages, topK = 10, threshold = 0.7) {
-  return pages
-    .map((p) => ({
-      ...p,
-      score: cosineSimilarity(queryVec, p.embedding),
-    }))
-    .filter((p) => p.score >= threshold)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK)
-    .map((p) => ({
-      id: p.id,
-      url: p.url,
-      title: p.title,
-      site: p.site,
-      visitedAt: p.lastVisitedAt || p.firstVisitedAt,
-      score: p.score,
-      snippet: (p.text || "").slice(0, 420),
-    }));
-}
-
 export { EMBED_DIM };

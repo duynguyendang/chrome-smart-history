@@ -65,15 +65,20 @@ Page finishes loading (tabs.onUpdated, status === "complete")
 Background SW → scripting.executeScript extracts page text (textContent, ≤5000 chars)
    │
    ▼
-SemanticEmbedder.embed(text, { taskType: "retrieval-document" })  → 768-dims
+SemanticEmbedder.embed(text, { taskType: "retrieval-document" })  → 768-dims (Float32Array)
    │
    ▼
-IndexedDB  { id = hash(url), url, title, text, embedding[768],
-             firstVisitedAt, lastVisitedAt, visitCount, device }
+IndexedDB  { id = hash(url), url, title, text, embedding[768], norm,
+             firstVisitedAt, lastVisitedAt, visitCount, device, dim }
    │
    ▼
-Popup: embed query/tab (taskType: "retrieval-query")
-   → cosine similarity over all pages → filter ≥ 0.7 → ranked results
+Worker (in-memory state) ← INITIALIZE_STATE on startup, ADD_PAGE on each index
+   │
+   ▼
+Popup: embed query/tab (taskType: "retrieval-query") → Float32Array
+   → transferred zero-copy into the Worker
+   → 2-stage Matryoshka (MRL) ranking over the in-memory index
+   → top-k (≥ 0.7 cosine) returned as lightweight metadata
 ```
 
 Key points:
@@ -88,8 +93,22 @@ Key points:
   window context, so it runs in an **Offscreen Document** when
   `chrome.offscreen` exists, and falls back to running directly in the service
   worker on builds that lack the Offscreen API.
+- **Fast, off-thread search (Web Worker).** All ranking runs in a dedicated
+  Web Worker that holds the page corpus **in memory** (`INITIALIZE_STATE` on
+  startup, `ADD_PAGE` on each new index). The main thread never re-reads
+  IndexedDB or serializes the whole corpus on a search — it only sends the
+  query vector (transferred zero-copy via its `ArrayBuffer`).
+- **Two-stage Matryoshka (MRL) retrieval.** Stage 1 ranks by the first 128
+  dimensions (a zero-allocation `subarray` view, norm computed on-the-fly) to
+  cheaply narrow N pages down to a candidate pool. Stage 2 re-ranks only
+  those candidates with the full 768-dim vector. The candidate pool is
+  **hard-capped** (`MAX_CANDIDATES = 1000`) so Stage-2 cost stays bounded
+  no matter how large the corpus grows.
+- **Zero-allocation storage.** Only the full 768-dim `Float32Array` and its
+  `norm` are persisted to IndexedDB. The 128-dim MRL sub-vector is derived
+  on-the-fly as a view over the same buffer — nothing redundant is stored.
 - **Threshold.** Similarity results are filtered at **0.7** cosine — tune in
-  `src/embedding.js` (`rankPages` default threshold) if you want broader recall.
+  `src/search-worker.js` (`rankPages` default threshold) if you want broader recall.
 - **Model dimension is 768** for the on-device EmbeddingGemma build used here.
   `dim` is stored per record.
 
@@ -103,10 +122,12 @@ chrome-smart-history/
 ├── LICENSE
 ├── NOTICE
 ├── src/
-│   ├── config.js            # shared constants
+│   ├── config.js            # shared constants (incl. MRL_SUB_DIM)
 │   ├── db.js               # IndexedDB (pages + search_cache stores)
-│   ├── embedding.js        # getEmbedder / embed / cosineSimilarity / rankPages
+│   ├── embedding.js        # getEmbedder / embedDocument / embedQuery
 │   ├── background.js       # capture + search orchestration (service worker)
+│   ├── search-worker.js   # in-memory MRL state manager (ranking off-thread)
+│   ├── search-client.js   # worker client (zero-copy query transfer)
 │   ├── offscreen-manager.js# ensures the offscreen document exists
 │   ├── content/extract.js  # fallback page-text extraction
 │   ├── offscreen/          # offscreen.html + offscreen.js (hosts Embedding API)
