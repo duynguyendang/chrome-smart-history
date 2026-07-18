@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Smart History</title>
+    <link rel="stylesheet" href="./popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Smart History</h1>
+      <span id="stats" class="muted"></span>
+    </header>
+
+    <div class="search">
+      <input
+        id="query"
+        type="text"
+        placeholder="Search by meaning… e.g. 'react performance tips'"
+        autocomplete="off"
+      />
+      <button id="searchBtn">Search</button>
+    </div>
+
+    <div id="status" class="status"></div>
+    <button id="indexBtn" class="secondary">Index current tab</button>
+    <ul id="results"></ul>
+
+    <footer>
+      <a id="optionsLink" href="#">Settings</a>
+      <button id="clearBtn" class="link">Clear all</button>
+    </footer>
+
+    <script type="module" src="./popup.js"></script>
+  </body>
+</html>

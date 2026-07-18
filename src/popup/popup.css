@@ -1,0 +1,82 @@
+:root {
+  --bg: #14161a;
+  --panel: #1d2026;
+  --text: #e6e8eb;
+  --muted: #8b919b;
+  --accent: #6ea8fe;
+  --border: #2a2e36;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  width: 520px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 12px 14px 8px;
+  border-bottom: 1px solid var(--border);
+}
+h1 { font-size: 15px; margin: 0; }
+.muted { color: var(--muted); font-size: 12px; }
+.search { display: flex; gap: 6px; padding: 12px 14px; }
+input {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  outline: none;
+}
+input:focus { border-color: var(--accent); }
+button {
+  background: var(--accent);
+  color: #0b0d10;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover { filter: brightness(1.08); }
+header { flex-shrink: 0; }
+.search { flex-shrink: 0; }
+.status { flex-shrink: 0; }
+footer { flex-shrink: 0; }
+.status { padding: 0 14px 8px; color: var(--muted); font-size: 12px; min-height: 16px; }
+ul { list-style: none; margin: 0; padding: 0 8px 8px; max-height: 70vh; overflow-y: auto; }
+li {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+li a.title { color: var(--text); font-weight: 600; text-decoration: none; }
+li a.title:hover { color: var(--accent); }
+li .meta { color: var(--muted); font-size: 11px; margin: 4px 0; }
+li .snippet { color: #c4c9d1; font-size: 12px; }
+li .score { float: right; color: var(--accent); font-size: 11px; }
+footer {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+}
+footer a, .link {
+  color: var(--muted);
+  font-size: 12px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+footer a:hover, .link:hover { color: var(--accent); }
+.empty { color: var(--muted); text-align: center; padding: 24px 14px; }

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Smart History — Settings</title>
+    <link rel="stylesheet" href="./options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Smart History — Settings</h1>
+
+      <label class="row">
+        <input type="checkbox" id="enabled" />
+        <span>Enable semantic capture (embed pages I visit)</span>
+      </label>
+
+      <label class="row">
+        <span>Retention (days)</span>
+        <input type="number" id="retention" min="1" max="3650" />
+      </label>
+
+      <label class="row">
+        <span>Capture delay (ms)</span>
+        <input type="number" id="captureDelay" min="0" max="10000" step="100" />
+      </label>
+
+      <p class="note">
+        All embeddings and page text stay on your device. This MVP has no cloud
+        sync. Requires Chrome Canary 152+ with <code>#semantic-embedder-api</code>
+        enabled and the EmbeddingGemma model downloaded.
+      </p>
+
+      <button id="save">Save</button>
+      <span id="saved" class="saved"></span>
+    </main>
+    <script type="module" src="./options.js"></script>
+  </body>
+</html>
