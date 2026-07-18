@@ -8,10 +8,10 @@ export const DEFAULT_TOP_K = 10;
 // Different cutoffs for the two entry points:
 //  - SIMILAR_CURRENT (popup opens on the active tab): stricter, so only
 //    pages genuinely similar to the current tab are shown.
-//  - SEARCH (free-text query): looser, so results are not hidden when the
-//    query is broad or loosely related.
-export const SIMILAR_THRESHOLD = 0.3;
-export const SEARCH_THRESHOLD = 0.0;
+//  - SEARCH (free-text query): looser, so results are not hidden when
+//    the query is broad or loosely related.
+export const SIMILAR_THRESHOLD = 0.7;
+export const SEARCH_THRESHOLD = 0.3;
 
 export const SETTINGS_KEY = "settings";
 export const DEVICE_ID_KEY = "deviceId";
